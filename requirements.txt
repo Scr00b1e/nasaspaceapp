@@ -1,0 +1,6 @@
+flask==3.0.3
+flask-cors==4.0.1
+pandas==2.2.2
+joblib==1.4.2
+gdown==5.1.0
+scikit-learn==1.5.1
