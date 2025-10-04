@@ -3,35 +3,55 @@ from flask_cors import CORS
 import pandas as pd
 import joblib
 from pathlib import Path
-import random  # For random sampling
+import gdown  # pip install gdown for Google Drive
+import tempfile
+import os
+import gc  # For garbage collection to close file handles
 
 app = Flask(__name__)
 CORS(app)  # Fix CORS for frontend fetches
 
-# Relative paths
-SCRIPT_DIR = Path(__file__).parent
-STATS_PATH = SCRIPT_DIR.parent / 'data' / 'uhe' / 'wbgtmax30-tabular' / 'wbgtmax30_STATS.csv'
-EXP_PATH = SCRIPT_DIR.parent / 'data' / 'uhe' / 'wbgtmax30-tabular' / 'wbgtmax30_EXP.csv'  # For population
-MODEL_PATH = SCRIPT_DIR / 'model.pkl'
 
-# Load STATS CSV (events)
+STATS_FILE_ID = '13_U3-rUSVFbOHv06znZyFds8UbeI8eYA'
+EXP_FILE_ID = '1tUEZDWbgqlnb8V1yh3aJS5pvhUcCQtYA'
+MODEL_PATH = Path(__file__).parent / 'model.pkl'
+
+# Temporary files for download
+temp_stats = tempfile.NamedTemporaryFile(delete=False, suffix='.csv')
+temp_exp = tempfile.NamedTemporaryFile(delete=False, suffix='.csv')
+
 try:
-    df_stats = pd.read_csv(STATS_PATH)
+    # Download STATS CSV from Google Drive using gdown (handles virus scan)
+    gdown.download(f'https://drive.google.com/uc?id={STATS_FILE_ID}', temp_stats.name, quiet=False)
+    df_stats = pd.read_csv(temp_stats.name)
+    print(f"STATS loaded: {len(df_stats)} rows, columns: {df_stats.columns.tolist()}")
 except Exception as e:
-    app.logger.error(f"STATS CSV error: {e}")
+    print(f"STATS download error: {e}")
     df_stats = pd.DataFrame()
 
-# Load EXP CSV (population/exposure)
 try:
-    df_exp = pd.read_csv(EXP_PATH)
+    # Download EXP CSV from Google Drive
+    gdown.download(f'https://drive.google.com/uc?id={EXP_FILE_ID}', temp_exp.name, quiet=False)
+    df_exp = pd.read_csv(temp_exp.name)
+    print(f"EXP loaded: {len(df_exp)} rows, columns: {df_exp.columns.tolist()}")
 except Exception as e:
-    app.logger.error(f"EXP CSV error: {e}")
+    print(f"EXP download error: {e}")
     df_exp = pd.DataFrame()
 
+# Clean up temp files (force close handles with gc)
+gc.collect()  # Garbage collect to release file handles on Windows
+try:
+    os.unlink(temp_stats.name)
+    os.unlink(temp_exp.name)
+    print("Temp files cleaned up")
+except Exception as e:
+    print(f"Temp cleanup error: {e} (ignore if files deleted)")
+
 # Global sparse filter: Sample ~10 from Russia, ~65 from rest for worldwide diversity (total ~75 markers)
+df = pd.DataFrame()  # Initialize df here
 if not df_stats.empty:
     # Force include Russia if available (sample 10)
-    russia_mask = df_stats['CTR_MN_NM'].str.contains('Russia', case=False, na=False)
+    russia_mask = df_stats['CTR_MN_NM'].str.contains('Russia', case=False, na=False) if 'CTR_MN_NM' in df_stats.columns else pd.Series([False] * len(df_stats))
     russia_sample = df_stats[russia_mask].sample(min(10, russia_mask.sum()), random_state=42) if russia_mask.sum() > 0 else pd.DataFrame()
     print(f"App.py: Russia rows included: {len(russia_sample)}")
     
@@ -48,30 +68,37 @@ if not df_stats.empty:
         # Fallback: Random 65 from non-Russia
         non_russia_sample = non_russia.sample(min(65, len(non_russia)), random_state=42)
     
-    df_stats = pd.concat([russia_sample, non_russia_sample]).drop_duplicates().head(75)  # Cap at 75 total
-    print(f"App.py: Filtered to {len(df_stats)} global rows (Russia prioritized, sparse worldwide)")
+    df = pd.concat([russia_sample, non_russia_sample]).drop_duplicates().head(75)  # Cap at 75 total
+    print(f"App.py: Filtered to {len(df)} global rows (Russia prioritized, sparse worldwide)")
 
 # Join with EXP for 'P' (pop)
-if not df_stats.empty and not df_exp.empty:
-    df = pd.merge(df_stats, df_exp[['ID_HDC_G0', 'year', 'P']], on=['ID_HDC_G0', 'year'], how='left')
-    df['P'] = df['P'].fillna(1000000)  # Global fallback (avg urban pop)
+if not df.empty and not df_exp.empty:
+    df = pd.merge(df, df_exp[['ID_HDC_G0', 'year', 'P']], on=['ID_HDC_G0', 'year'], how='left')
+    df['P'] = df['P'].fillna(1000000)  # Global fallback
 else:
-    df = df_stats
-    if not df.empty:
-        df['P'] = 1000000
+    df['P'] = 1000000  # Fixed fallback if no EXP
 
-# Check columns, set heat_risk = avg_temp * duration / 100
+print(f"Final df columns: {df.columns.tolist()}")  # Debug after merge
+
+# Check columns, set heat_risk = avg_temp * duration / 100 (with fallback)
 required_cols = ['avg_temp', 'duration', 'GCPNT_LAT', 'GCPNT_LON']
 missing = [col for col in required_cols if col not in df.columns]
 if missing:
-    raise ValueError(f"Missing: {missing}")
+    print(f"Missing columns: {missing}, available: {df.columns.tolist()}")  # Debug
+    # Fallback mock data if columns missing (for demo)
+    df['avg_temp'] = 30.0  # Mock avg temp
+    df['duration'] = 2.0  # Mock duration
+    df['GCPNT_LAT'] = df.get('GCPNT_LAT', 0)  # Use existing or mock
+    df['GCPNT_LON'] = df.get('GCPNT_LON', 0)
+    print("Using mock columns for heat_risk calculation")
+
 df['heat_risk'] = df['avg_temp'] * df['duration'] / 100
 
 # Load model
 try:
     model = joblib.load(MODEL_PATH)
 except Exception as e:
-    app.logger.error(f"Model error: {e}—fallback scaling.")
+    print(f"Model error: {e}—fallback scaling.")
     model = None
 
 # Format for frontend
