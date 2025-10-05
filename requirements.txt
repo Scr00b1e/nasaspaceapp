@@ -1,9 +1,9 @@
 flask==3.0.3
 flask-cors==4.0.1
-pandas==2.1.4  # Pinned for pre-built wheels on Render
+pandas==2.2.3  # Latest with Python 3.13 partial fixes, but use with 3.12
 joblib==1.4.2
 gdown==5.1.0
 scikit-learn==1.5.1
 gunicorn==22.0.0  # For production
-ninja==1.11.1  # Fixes Ninja version issue
+ninja==1.11.1  # Fixes Ninja build issues
 meson==1.3.2  # Ensures Meson compatibility
