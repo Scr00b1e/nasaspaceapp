@@ -7,7 +7,6 @@ import gdown  # pip install gdown for Google Drive
 import tempfile
 import os
 import gc  # For garbage collection to close file handles
-import random  # For random sampling
 
 app = Flask(__name__)
 CORS(app)  # Fix CORS for frontend fetches
@@ -15,69 +14,85 @@ CORS(app)  # Fix CORS for frontend fetches
 # Google Drive file IDs (extract from your URLs)
 STATS_FILE_ID = '13_U3-rUSVFbOHv06znZyFds8UbeI8eYA'
 EXP_FILE_ID = '1tUEZDWbgqlnb8V1yh3aJS5pvhUcCQtYA'
-MODEL_PATH = Path(__file__).parent / 'model.pkl'  # Model still local
+MODEL_PATH = Path(__file__).parent / 'model.pkl'
 
 # Temporary files for download
 temp_stats = tempfile.NamedTemporaryFile(delete=False, suffix='.csv')
 temp_exp = tempfile.NamedTemporaryFile(delete=False, suffix='.csv')
 
-# Download STATS CSV from Google Drive using gdown (handles virus scan)
 try:
+    # Download STATS CSV from Google Drive using gdown (handles virus scan)
     gdown.download(f'https://drive.google.com/uc?id={STATS_FILE_ID}', temp_stats.name, quiet=False)
-    print(f"STATS downloaded to temp: {os.path.getsize(temp_stats.name) / (1024*1024):.1f} MB")
+    df_stats = pd.read_csv(temp_stats.name)
+    print(f"STATS loaded: {len(df_stats)} rows, columns: {df_stats.columns.tolist()}")
 except Exception as e:
     print(f"STATS download error: {e}")
     df_stats = pd.DataFrame()
 
-# Download EXP CSV from Google Drive
 try:
+    # Download EXP CSV from Google Drive
     gdown.download(f'https://drive.google.com/uc?id={EXP_FILE_ID}', temp_exp.name, quiet=False)
-    print(f"EXP downloaded to temp: {os.path.getsize(temp_exp.name) / (1024*1024):.1f} MB")
+    df_exp = pd.read_csv(temp_exp.name)
+    print(f"EXP loaded: {len(df_exp)} rows, columns: {df_exp.columns.tolist()}")
 except Exception as e:
     print(f"EXP download error: {e}")
     df_exp = pd.DataFrame()
 
-# Chunked load for STATS (low memory, sample 150 random rows)
-df_stats = pd.DataFrame()
-if os.path.exists(temp_stats.name):
-    try:
-        chunks = pd.read_csv(temp_stats.name, chunksize=1000)  # 1k rows per chunk
-        all_chunks = []
-        for chunk in chunks:
-            all_chunks.append(chunk.sample(min(10, len(chunk)), random_state=random.randint(1, 1000)))  # Sample 10 per chunk
-            del chunk  # Discard chunk
-        df_stats = pd.concat(all_chunks, ignore_index=True).drop_duplicates().head(150)  # Total 150 unique
-        print(f"STATS loaded chunked: {len(df_stats)} rows, columns: {df_stats.columns.tolist()}")
-    except Exception as e:
-        print(f"STATS chunk error: {e}")
-        df_stats = pd.DataFrame()
-    finally:
-        gc.collect()  # GC to free memory
-
-# Chunked load for EXP (sample 150)
-df_exp = pd.DataFrame()
-if os.path.exists(temp_exp.name):
-    try:
-        chunks = pd.read_csv(temp_exp.name, chunksize=1000)  # 1k rows per chunk
-        all_chunks = []
-        for chunk in chunks:
-            all_chunks.append(chunk.sample(min(10, len(chunk)), random_state=random.randint(1, 1000)))  # Sample 10 per chunk
-            del chunk  # Discard chunk
-        df_exp = pd.concat(all_chunks, ignore_index=True).drop_duplicates().head(150)  # Total 150 unique
-        print(f"EXP loaded chunked: {len(df_exp)} rows, columns: {df_exp.columns.tolist()}")
-    except Exception as e:
-        print(f"EXP chunk error: {e}")
-        df_exp = pd.DataFrame()
-    finally:
-        gc.collect()  # GC to free memory
-
-# Clean up temp files
+# Clean up temp files (force close handles with gc)
+gc.collect()  # Garbage collect to release file handles on Windows
 try:
     os.unlink(temp_stats.name)
     os.unlink(temp_exp.name)
     print("Temp files cleaned up")
 except Exception as e:
     print(f"Temp cleanup error: {e} (ignore if files deleted)")
+
+# Global sparse filter: Sample ~10 from Russia, ~65 from rest for worldwide diversity (total ~75 markers)
+df = pd.DataFrame()  # Initialize df here
+if not df_stats.empty:
+    # Force include Russia if available (sample 10)
+    russia_mask = df_stats['CTR_MN_NM'].str.contains('Russia', case=False, na=False) if 'CTR_MN_NM' in df_stats.columns else pd.Series([False] * len(df_stats))
+    russia_sample = df_stats[russia_mask].sample(min(10, russia_mask.sum()), random_state=42) if russia_mask.sum() > 0 else pd.DataFrame()
+    print(f"App.py: Russia rows included: {len(russia_sample)}")
+    
+    # Rest: Sample from non-Russia for diversity
+    non_russia = df_stats[~russia_mask]
+    if 'region' in non_russia.columns:
+        # Sample 10 per region (excluding Russia)
+        sampled_groups = []
+        for region, group in non_russia.groupby('region'):
+            sample = group.sample(min(10, len(group)), random_state=42)
+            sampled_groups.append(sample)
+        non_russia_sample = pd.concat(sampled_groups).drop_duplicates()
+    else:
+        # Fallback: Random 65 from non-Russia
+        non_russia_sample = non_russia.sample(min(65, len(non_russia)), random_state=42)
+    
+    df = pd.concat([russia_sample, non_russia_sample]).drop_duplicates().head(75)  # Cap at 75 total
+    print(f"App.py: Filtered to {len(df)} global rows (Russia prioritized, sparse worldwide)")
+
+# Join with EXP for 'P' (pop)
+if not df.empty and not df_exp.empty:
+    df = pd.merge(df, df_exp[['ID_HDC_G0', 'year', 'P']], on=['ID_HDC_G0', 'year'], how='left')
+    df['P'] = df['P'].fillna(1000000)  # Global fallback
+else:
+    df['P'] = 1000000  # Fixed fallback if no EXP
+
+print(f"Final df columns: {df.columns.tolist()}")  # Debug after merge
+
+# Check columns, set heat_risk = avg_temp * duration / 100 (with fallback)
+required_cols = ['avg_temp', 'duration', 'GCPNT_LAT', 'GCPNT_LON']
+missing = [col for col in required_cols if col not in df.columns]
+if missing:
+    print(f"Missing columns: {missing}, available: {df.columns.tolist()}")  # Debug
+    # Fallback mock data if columns missing (for demo)
+    df['avg_temp'] = 30.0  # Mock avg temp
+    df['duration'] = 2.0  # Mock duration
+    df['GCPNT_LAT'] = df.get('GCPNT_LAT', 0)  # Use existing or mock
+    df['GCPNT_LON'] = df.get('GCPNT_LON', 0)
+    print("Using mock columns for heat_risk calculation")
+
+df['heat_risk'] = df['avg_temp'] * df['duration'] / 100
 
 # Load model
 try:
@@ -100,40 +115,14 @@ def format_data(input_df):
 
 @app.route("/api/heat-data")
 def heat_data():
-    if df_stats.empty:
+    if df.empty:
         return jsonify([])
-    
-    # Use the chunked df_stats (150 rows)
-    df_sample = df_stats.copy()
-    
-    # Join with EXP for 'P' (pop)
-    if not df_exp.empty:
-        df_sample = pd.merge(df_sample, df_exp[['ID_HDC_G0', 'year', 'P']], on=['ID_HDC_G0', 'year'], how='left')
-        df_sample['P'] = df_sample['P'].fillna(1000000)  # Global fallback
-    else:
-        df_sample['P'] = 1000000  # Fixed fallback
-
-    # Check columns, set heat_risk = avg_temp * duration / 100
-    required_cols = ['avg_temp', 'duration', 'GCPNT_LAT', 'GCPNT_LON']
-    missing = [col for col in required_cols if col not in df_sample.columns]
-    if missing:
-        print(f"Missing columns: {missing}, available: {df_sample.columns.tolist()}")  # Debug
-        # Fallback mock data if columns missing (for demo)
-        df_sample['avg_temp'] = 30.0  # Mock avg temp
-        df_sample['duration'] = 2.0  # Mock duration
-        df_sample['GCPNT_LAT'] = df_sample.get('GCPNT_LAT', 0)  # Use existing or mock
-        df_sample['GCPNT_LON'] = df_sample.get('GCPNT_LON', 0)
-        print("Using mock columns for heat_risk calculation")
-
-    df_sample['heat_risk'] = df_sample['avg_temp'] * df_sample['duration'] / 100
-
-    return jsonify(format_data(df_sample))
+    return jsonify(format_data(df))
 
 @app.route("/sim")
 def simulate():
     green_increase = float(request.args.get("green", 0))
-    # For sim, use the last loaded df_stats (global, or regenerate if needed)
-    simulated_df = df_stats.copy()  # From startup chunked sample
+    simulated_df = df.copy()
 
     if model:
         current_green = 20.0  # Avg urban green from GEE
