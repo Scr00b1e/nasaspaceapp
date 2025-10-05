@@ -1,8 +1,9 @@
-pip==25.2
 flask==3.0.3
 flask-cors==4.0.1
-pandas==2.2.2
+pandas==2.1.4  # Pinned for pre-built wheels on Render
 joblib==1.4.2
 gdown==5.1.0
 scikit-learn==1.5.1
-gunicorn==22.0.0
+gunicorn==22.0.0  # For production
+ninja==1.11.1  # Fixes Ninja version issue
+meson==1.3.2  # Ensures Meson compatibility
