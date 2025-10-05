@@ -4,3 +4,4 @@ pandas==2.2.2
 joblib==1.4.2
 gdown==5.1.0
 scikit-learn==1.5.1
+gunicorn==22.0.0
